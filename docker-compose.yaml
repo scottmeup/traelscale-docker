@@ -1,0 +1,110 @@
+services:
+
+# Traefik proxy on Tailscale 'tailnet' for remote access.
+  # Tailscale (mesh VPN) - Shares its networking namespace with the 'traefik' service.
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    security_opt:
+      - no-new-privileges:true
+    # set hostname to SUBDOMAIN from env to allow auto configuration of Tailscale magicdns. need to run "tailscale funnel -bg --https=443 localhost:443" on the tailscale container after changing this setting 
+    hostname: ${SUBDOMAIN}
+    ports:
+      - 80:80
+      - 443:443
+    environment:
+      # Generate TS_AUTHKEY here https://login.tailscale.com/admin/settings/keys or https://login.tailscale.com/admin/settings/oauth
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_EXTRA_ARGS=${TS_EXTRA_ARGS}
+      - TS_STATE_DIR=/var/lib/tailscale
+      # Tailscale socket - Required unless you use the (current) default location /tmp; potentially fixed in v1.73.0 
+      - TS_SOCKET=/var/run/tailscale/tailscaled.sock
+    volumes:
+      - ./tailscale/data:/var/lib/tailscale:rw
+      # Makes the tailscale socket (defined above) available to other services.
+      - ./tailscale:/var/run/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+      - sys_module
+    restart: unless-stopped
+
+  # Traefik
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    security_opt:
+      - no-new-privileges:true
+    network_mode: service:tailscale
+    depends_on:
+      - tailscale
+    volumes:
+      # Logs
+      - ./traefik/logs:/logs:rw
+      # Access to Docker socket for provider, discovery.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Access to Tailscale files for cert generation.
+      - ./tailscale/data:/var/lib/tailscale:rw
+      # Access to Tailscale socket for cert generation.
+      - ./tailscale:/var/run/tailscale
+      # Access host's time 
+      - /etc/localtime:/etc/localtime:ro
+    command:
+      # Enable logging in docker
+      - "--accesslog=true"
+      - "--log.level=DEBUG"
+      # Enable access to docker services
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      # Dont enable docker service unless it's labelled with "traefik.enable=true"
+      - "--providers.docker.exposedbydefault=false"
+      # Enable access on specified ports, referenced by web for port 80 and websecure for port 443
+      - "--entryPoints.websecure.address=:443"
+      - "--entryPoints.web.address=:80"
+      # Enable tailscale TLS resolver
+      - "--certificatesresolvers.myresolver.tailscale=true"
+      # Enable Traefik APIs - these should be disabled in production
+      - "--api=true"
+      - "--api.dashboard=true"
+      - "--api.debug=true"
+      # Redirect requests for insecure entrypoint to secure entrypoint
+      - "--entryPoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entryPoints.web.http.redirections.entryPoint.scheme=https"
+      #- "--serversTransport.insecureSkipVerify=true"
+    environment:
+      - GENERIC_TIMEZONE
+    labels:
+      # enable traefic to provide reverse proxy service for this container
+      - traefik.enable=true
+      # enable api access on this container, required for dashboard
+      - traefik.http.routers.traefik_dashboard.service=api@internal
+      # enable authentication & load user credentials from env. 
+      - traefik.http.routers.traefik_dashboard.middlewares=myauth
+      - traefik.http.middlewares.myauth.basicauth.users=${TRAEFIK_DASHBOARD_CREDENTIALS}
+      # set the local port to 443
+      - traefik.http.services.traefik_dashboard.loadbalancer.server.port=443
+      # set the entry point to websecure for https as defined under "command:"
+      - traefik.http.routers.traefik_dashboard.entrypoints=websecure 
+      # give access to this container at SUBDOMAIN.DOMAIN_NAME/dashboard and /api . note: dashboard access is at "https://SUBDOMAIN.DOMAIN_NAME:443/dashboard/". Trailing '/' is mandatory. see https://doc.traefik.io/traefik/operations/api/#endpoints for api and debug endpoints.
+      - traefik.http.routers.traefik_dashboard.rule=Host(`${SUBDOMAIN}.${DOMAIN_NAME}`) && (PathPrefix(`/api`) || PathPrefix(`/dashboard`) || PathPrefix(`/debug`))
+      # tell traefik to accept only https requests - https://doc.traefik.io/traefik/routing/routers/#tls
+      #- traefik.http.routers.traefik_dashboard.tls=true #enabling this results in 404 error
+      # Enable Tailscale cert resolver for this container. myresolver is defined under "command:"
+      #- traefik.http.routers.traefik_dashboard.tls.certresolver=myresolver #enabling this results in 404 error
+    
+
+  # whoami
+  whoami:
+    image: traefik/whoami
+    container_name: whoami
+    labels:
+      # flag this docker for traefik to use, due to the fact we earlier set --providers.docker.exposedbydefault=false
+      - traefik.enable=true
+      # Listen on local = localhost:80, remote = https://SUBDOMAIN.DOMAIN_NAME:443/whoami
+      - traefik.http.services.whoami_https.loadbalancer.server.port=80
+      - traefik.http.routers.whoami_https.rule=Host(`${SUBDOMAIN}.${DOMAIN_NAME}`) && Path(`/whoami`)
+      - traefik.http.routers.whoami_https.entrypoints=websecure
+      # tell traefik to accept only https requests - https://doc.traefik.io/traefik/routing/routers/#tls
+      #- traefik.http.routers.whoami_https.tls=true #enabling this results in 404 error
+      # Enable Tailscale cert resolver for this container. myresolver is defined under "command:"
+      #- traefik.http.routers.whoami_https.tls.certresolver=myresolver #enabling this results in 404 error
